@@ -1,6 +1,9 @@
 import argparse
 import logging
 import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from agent.simple_agent import SimpleAgent
 
@@ -49,6 +52,11 @@ def main():
         default=None, 
         help="Path to a saved state to load"
     )
+    parser.add_argument(
+        "--interactive", 
+        action="store_true", 
+        help="Run in interactive mode (wait for user input after each step)"
+    )
     
     args = parser.parse_args()
     
@@ -72,6 +80,7 @@ def main():
         sound=args.sound if args.display else False,
         max_history=args.max_history,
         load_state=args.load_state,
+        interactive=args.interactive,
     )
     
     try:

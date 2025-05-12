@@ -13,9 +13,13 @@ A minimal implementation of Claude playing Pokemon Red using the PyBoy emulator.
    ```
    pip install -r requirements.txt
    ```
-3. Set up your Anthropic API key as an environment variable:
+3. Set up your OpenAI API key in the `.env` file:
    ```
-   export ANTHROPIC_API_KEY=your_api_key_here
+   # Copy the template file
+   cp .env.template .env
+   
+   # Edit the .env file and add your API key
+   # OPENAI_API_KEY=your_api_key_here
    ```
 
 4. Place your Pokemon Red ROM file in the root directory (you need to provide your own ROM)

@@ -1,17 +1,40 @@
 import base64
 import copy
 import io
+import json
 import logging
 import os
+
+# Set environment variable to disable LiteLLM logs
+os.environ['LITELLM_LOG'] = 'ERROR'
 
 from config import MAX_TOKENS, MODEL_NAME, TEMPERATURE, USE_NAVIGATOR
 
 from agent.emulator import Emulator
-from anthropic import Anthropic
+import litellm
+from litellm import completion
+from dotenv import load_dotenv
+
+# Completely disable LiteLLM debugging
+litellm._logging._disable_debugging()
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Set the OPENAI_API_KEY environment variable
+openai_api_key = os.getenv("OPENAI_API_KEY")
+if openai_api_key:
+    os.environ["OPENAI_API_KEY"] = openai_api_key
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
+
+# Suppress all LiteLLM logs using multiple approaches
+# 1. Set the logger level to higher than CRITICAL
+for logger_name in ["LiteLLM", "LiteLLM Proxy", "LiteLLM Router"]:
+    litellm_logger = logging.getLogger(logger_name)
+    litellm_logger.setLevel(logging.CRITICAL + 1)
 
 
 def get_screenshot_base64(screenshot, upscale=1):
@@ -49,52 +72,58 @@ The summary should be comprehensive enough that you can continue gameplay withou
 
 AVAILABLE_TOOLS = [
     {
-        "name": "press_buttons",
-        "description": "Press a sequence of buttons on the Game Boy.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "buttons": {
-                    "type": "array",
-                    "items": {
-                        "type": "string",
-                        "enum": ["a", "b", "start", "select", "up", "down", "left", "right"]
+        "type": "function",
+        "function": {
+            "name": "press_buttons",
+            "description": "Press a sequence of buttons on the Game Boy.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "buttons": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": ["a", "b", "start", "select", "up", "down", "left", "right"]
+                        },
+                        "description": "List of buttons to press in sequence. Valid buttons: 'a', 'b', 'start', 'select', 'up', 'down', 'left', 'right'"
                     },
-                    "description": "List of buttons to press in sequence. Valid buttons: 'a', 'b', 'start', 'select', 'up', 'down', 'left', 'right'"
+                    "wait": {
+                        "type": "boolean",
+                        "description": "Whether to wait for a brief period after pressing each button. Defaults to true."
+                    }
                 },
-                "wait": {
-                    "type": "boolean",
-                    "description": "Whether to wait for a brief period after pressing each button. Defaults to true."
-                }
-            },
-            "required": ["buttons"],
-        },
+                "required": ["buttons"]
+            }
+        }
     }
 ]
 
 if USE_NAVIGATOR:
     AVAILABLE_TOOLS.append({
-        "name": "navigate_to",
-        "description": "Automatically navigate to a position on the map grid. The screen is divided into a 9x10 grid, with the top-left corner as (0, 0). This tool is only available in the overworld.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "row": {
-                    "type": "integer",
-                    "description": "The row coordinate to navigate to (0-8)."
+        "type": "function",
+        "function": {
+            "name": "navigate_to",
+            "description": "Automatically navigate to a position on the map grid. The screen is divided into a 9x10 grid, with the top-left corner as (0, 0). This tool is only available in the overworld.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "row": {
+                        "type": "integer",
+                        "description": "The row coordinate to navigate to (0-8)."
+                    },
+                    "col": {
+                        "type": "integer",
+                        "description": "The column coordinate to navigate to (0-9)."
+                    }
                 },
-                "col": {
-                    "type": "integer",
-                    "description": "The column coordinate to navigate to (0-9)."
-                }
-            },
-            "required": ["row", "col"],
-        },
+                "required": ["row", "col"]
+            }
+        }
     })
 
 
 class SimpleAgent:
-    def __init__(self, rom_path, headless=True, sound=False, max_history=60, load_state=None):
+    def __init__(self, rom_path, headless=True, sound=False, max_history=60, load_state=None, interactive=False):
         """Initialize the simple agent.
 
         Args:
@@ -102,21 +131,33 @@ class SimpleAgent:
             headless: Whether to run without display
             sound: Whether to enable sound
             max_history: Maximum number of messages in history before summarization
+            load_state: Path to a saved state to load
+            interactive: Whether to run in interactive mode (wait for user input after each step)
         """
         self.emulator = Emulator(rom_path, headless, sound)
         self.emulator.initialize()  # Initialize the emulator
-        self.client = Anthropic()
         self.running = True
         self.message_history = [{"role": "user", "content": "You may now begin playing."}]
         self.max_history = max_history
+        self.interactive = interactive
+        
         if load_state:
             logger.info(f"Loading saved state from {load_state}")
             self.emulator.load_state(load_state)
 
     def process_tool_call(self, tool_call):
         """Process a single tool call."""
-        tool_name = tool_call.name
-        tool_input = tool_call.input
+        # Handle the new function format from LiteLLM
+        if hasattr(tool_call, 'function'):
+            # New format from LiteLLM
+            tool_name = tool_call.function.name
+            # Properly parse JSON arguments instead of using eval
+            tool_input = json.loads(tool_call.function.arguments)
+        else:
+            # Original format
+            tool_name = tool_call.name
+            tool_input = tool_call.input
+            
         logger.info(f"Processing tool call: {tool_name}")
 
         if tool_name == "press_buttons":
@@ -235,55 +276,78 @@ class SimpleAgent:
                     if len(messages) >= 5 and messages[-3]["role"] == "user" and isinstance(messages[-3]["content"], list) and messages[-3]["content"]:
                         messages[-3]["content"][-1]["cache_control"] = {"type": "ephemeral"}
 
-
-                # Get model response
-                response = self.client.messages.create(
+                # Get response using LiteLLM
+                response = completion(
                     model=MODEL_NAME,
+                    messages=[{"role": "system", "content": SYSTEM_PROMPT}] + messages,
                     max_tokens=MAX_TOKENS,
-                    system=SYSTEM_PROMPT,
-                    messages=messages,
-                    tools=AVAILABLE_TOOLS,
                     temperature=TEMPERATURE,
+                    tools=AVAILABLE_TOOLS
                 )
 
                 logger.info(f"Response usage: {response.usage}")
 
-                # Extract tool calls
-                tool_calls = [
-                    block for block in response.content if block.type == "tool_use"
-                ]
-
+                # Get the message content and tool calls
+                message = response.choices[0].message
+                content = message.content
+                tool_calls = message.tool_calls if hasattr(message, 'tool_calls') else []
+                
                 # Display the model's reasoning
-                for block in response.content:
-                    if block.type == "text":
-                        logger.info(f"[Text] {block.text}")
-                    elif block.type == "tool_use":
-                        logger.info(f"[Tool] Using tool: {block.name}")
+                logger.info(f"[Text] {content}")
+                
+                if tool_calls:
+                    for tool_call in tool_calls:
+                        logger.info(f"[Tool] Using tool: {tool_call.function.name}")
 
                 # Process tool calls
                 if tool_calls:
-                    # Add assistant message to history
-                    assistant_content = []
-                    for block in response.content:
-                        if block.type == "text":
-                            assistant_content.append({"type": "text", "text": block.text})
-                        elif block.type == "tool_use":
-                            assistant_content.append({"type": "tool_use", **dict(block)})
+                    # Log the tool calls for debugging
+                    for tc in tool_calls:
+                        logger.info(f"Tool call: id={tc.id}, name={tc.function.name}")
+                        logger.info(f"Arguments: {tc.function.arguments}")
                     
-                    self.message_history.append(
-                        {"role": "assistant", "content": assistant_content}
-                    )
+                    # Add LLM's response to history
+                    self.message_history.append({
+                        "role": "assistant",
+                        "content": content,
+                        "tool_calls": [{
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.function.name,
+                                "arguments": tc.function.arguments
+                            }
+                        } for tc in tool_calls]
+                    })
                     
                     # Process tool calls and create tool results
                     tool_results = []
                     for tool_call in tool_calls:
+                        # Process the tool call directly without creating an adapted version
                         tool_result = self.process_tool_call(tool_call)
                         tool_results.append(tool_result)
                     
-                    # Add tool results to message history
-                    self.message_history.append(
-                        {"role": "user", "content": tool_results}
-                    )
+                    # Add tool results to message history in a format compatible with OpenAI/LiteLLM
+                    # For OpenAI, we need to add a tool message for each tool call
+                    for i, tool_call in enumerate(tool_calls):
+                        tool_result_text = ""
+                        # Extract text content from the tool result
+                        for content_item in tool_results[i].get('content', []):
+                            if content_item.get('type') == 'text':
+                                tool_result_text += content_item.get('text', '') + "\n"
+                        
+                        # Add as a tool message with the specific tool_call_id
+                        self.message_history.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "content": tool_result_text.strip()
+                        })
+                    
+                    # Also add a user message to continue the conversation
+                    self.message_history.append({
+                        "role": "user",
+                        "content": "What's your next move based on what you see?"
+                    })
 
                     # Check if we need to summarize the history
                     if len(self.message_history) >= self.max_history:
@@ -291,6 +355,13 @@ class SimpleAgent:
 
                 steps_completed += 1
                 logger.info(f"Completed step {steps_completed}/{num_steps}")
+                
+                # Add breakpoint - wait for user input to continue if in interactive mode
+                if self.interactive:
+                    user_input = input("Press Enter to continue to the next step (or 'q' to quit): ")
+                    if user_input.lower() == 'q':
+                        logger.info("User requested to quit")
+                        self.running = False
 
             except KeyboardInterrupt:
                 logger.info("Received keyboard interrupt, stopping")
@@ -335,33 +406,33 @@ class SimpleAgent:
             }
         ]
         
-        # Get summary from Claude
-        response = self.client.messages.create(
+        # Get summary using LiteLLM
+        response = completion(
             model=MODEL_NAME,
+            messages=[{"role": "system", "content": SYSTEM_PROMPT}] + messages,
             max_tokens=MAX_TOKENS,
-            system=SYSTEM_PROMPT,
-            messages=messages,
             temperature=TEMPERATURE
         )
         
         # Extract the summary text
-        summary_text = " ".join([block.text for block in response.content if block.type == "text"])
+        summary_text = response.choices[0].message.content
         
         logger.info(f"[Agent] Game Progress Summary:")
         logger.info(f"{summary_text}")
         
-        # Replace message history with just the summary
+        # Create a combined text message with the summary
+        combined_text = f"CONVERSATION HISTORY SUMMARY (representing {self.max_history} previous messages): {summary_text}\n\n"
+        combined_text += "You were just asked to summarize your playthrough so far, which is the summary you see above.\n"
+        combined_text += "Here is the current game state. You may now continue playing by selecting your next action."
+        
+        # Replace message history with just the summary and a new screenshot
         self.message_history = [
             {
                 "role": "user",
                 "content": [
                     {
                         "type": "text",
-                        "text": f"CONVERSATION HISTORY SUMMARY (representing {self.max_history} previous messages): {summary_text}"
-                    },
-                    {
-                        "type": "text",
-                        "text": "\n\nCurrent game screenshot for reference:"
+                        "text": combined_text
                     },
                     {
                         "type": "image",
@@ -370,11 +441,7 @@ class SimpleAgent:
                             "media_type": "image/png",
                             "data": screenshot_b64,
                         },
-                    },
-                    {
-                        "type": "text",
-                        "text": "You were just asked to summarize your playthrough so far, which is the summary you see above. You may now continue playing by selecting your next action."
-                    },
+                    }
                 ]
             }
         ]

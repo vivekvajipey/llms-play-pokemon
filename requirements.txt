@@ -1,5 +1,5 @@
 # Core requirements
-anthropic>=0.39.0  # For Claude API
+litellm>=1.69.0    # For LLM API abstraction
 pyboy==2.2.0       # For Pokemon emulator
 
 # Image processing
