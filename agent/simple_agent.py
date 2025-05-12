@@ -161,6 +161,27 @@ def history_for_responses(msgs):
                 "call_id": m["tool_call_id"],
                 "output": out_str,  # Must be a string
             })
+        # Handle messages with content arrays (like those with images)
+        elif m.get("role") and isinstance(m.get("content"), list):
+            # For OpenAI Responses API, we need to convert content types
+            new_content = []
+            for item in m["content"]:
+                if item.get("type") == "text":
+                    new_content.append({
+                        "type": "input_text",
+                        "text": item["text"]
+                    })
+                elif item.get("type") == "image":
+                    new_content.append({
+                        "type": "input_image",
+                        "source": item["source"]
+                    })
+            
+            # Create a new message with the converted content
+            converted.append({
+                "role": m["role"],
+                "content": new_content
+            })
         # Regular chat messages stay unchanged
         else:
             converted.append(m)
@@ -212,7 +233,19 @@ class SimpleAgent:
         self.emulator = Emulator(rom_path, headless, sound)
         self.emulator.initialize()  # Initialize the emulator
         self.running = True
-        self.message_history = [{"role": "user", "content": "You may now begin playing."}]
+        
+        # Set initial message based on API type
+        if API_TYPE == "litellm":
+            self.message_history = [{"role": "user", "content": "You may now begin playing."}]
+        else:  # OpenAI Responses API format
+            self.message_history = [{
+                "role": "user", 
+                "content": [{
+                    "type": "input_text",
+                    "text": "You may now begin playing."
+                }]
+            }]
+            
         self.max_history = max_history
         self.interactive = interactive
         
@@ -613,25 +646,49 @@ class SimpleAgent:
         combined_text += "Here is the current game state. You may now continue playing by selecting your next action."
         
         # Replace message history with just the summary and a new screenshot
-        self.message_history = [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": combined_text
-                    },
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/png",
-                            "data": screenshot_b64,
+        # Use different format based on API type
+        if API_TYPE == "litellm":
+            # LiteLLM format
+            self.message_history = [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": combined_text
                         },
-                    }
-                ]
-            }
-        ]
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": screenshot_b64,
+                            },
+                        }
+                    ]
+                }
+            ]
+        else:
+            # OpenAI Responses API format
+            self.message_history = [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": combined_text
+                        },
+                        {
+                            "type": "input_image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": screenshot_b64,
+                            },
+                        }
+                    ]
+                }
+            ]
         
         logger.info(f"[Agent] Message history condensed into summary.")
         
