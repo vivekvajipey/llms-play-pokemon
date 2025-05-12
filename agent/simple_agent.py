@@ -4,15 +4,20 @@ import io
 import json
 import logging
 import os
+import copy
 
 # Set environment variable to disable LiteLLM logs
 os.environ['LITELLM_LOG'] = 'ERROR'
 
-from config import MAX_TOKENS, MODEL_NAME, TEMPERATURE, USE_NAVIGATOR
+from config import (
+    MAX_TOKENS, MODEL_NAME, TEMPERATURE, USE_NAVIGATOR,
+    API_TYPE, REASONING_EFFORT, REASONING_SUMMARY
+)
 
 from agent.emulator import Emulator
 import litellm
 from litellm import completion
+import openai
 from dotenv import load_dotenv
 
 # Completely disable LiteLLM debugging
@@ -21,10 +26,13 @@ litellm._logging._disable_debugging()
 # Load environment variables from .env file
 load_dotenv()
 
-# Set the OPENAI_API_KEY environment variable
+# Set the API keys based on the selected API type
 openai_api_key = os.getenv("OPENAI_API_KEY")
 if openai_api_key:
     os.environ["OPENAI_API_KEY"] = openai_api_key
+    # Also set for LiteLLM in case we're using it
+    if API_TYPE == "litellm":
+        os.environ["LITELLM_OPENAI_API_KEY"] = openai_api_key
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
@@ -70,6 +78,7 @@ Please include:
 The summary should be comprehensive enough that you can continue gameplay without losing important context about what has happened so far."""
 
 
+# LiteLLM tool format
 AVAILABLE_TOOLS = [
     {
         "type": "function",
@@ -98,12 +107,75 @@ AVAILABLE_TOOLS = [
     }
 ]
 
+# Function to convert LiteLLM tool format to OpenAI Responses API format
+def convert_litellm_to_openai(tools_lite):
+    openai_tools = []
+    for t in tools_lite:
+        # only functions for now
+        if t.get("type") == "function":
+            fn = t["function"]
+            openai_tools.append({
+                "type": "function",
+                "name": fn["name"],
+                "description": fn["description"],
+                "parameters": fn["parameters"],
+            })
+    return openai_tools
+
+# Function to convert chat history to Responses API format
+def history_for_responses(msgs):
+    """Convert internal chat-style history to Responses API format."""
+    converted = []
+    for m in msgs:
+        # Handle assistant messages that contain tool_calls
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            # Keep the assistant's content as a regular message
+            if m.get("content"):
+                converted.append({
+                    "role": "assistant",
+                    "content": m["content"]
+                })
+            
+            # Add each tool call as a function_call item
+            for tc in m["tool_calls"]:
+                # Ensure arguments is a JSON string
+                arg_str = tc["function"]["arguments"]
+                if not isinstance(arg_str, str):
+                    arg_str = json.dumps(arg_str)
+                    
+                converted.append({
+                    "type": "function_call",
+                    "call_id": tc["id"],
+                    "name": tc["function"]["name"],
+                    "arguments": arg_str,  # Must be a JSON string
+                })
+        # Handle tool role messages (function call outputs)
+        elif m.get("role") == "tool":
+            # Ensure output is a string
+            out_str = m["content"]
+            if not isinstance(out_str, str):
+                out_str = json.dumps(out_str)
+                
+            converted.append({
+                "type": "function_call_output",
+                "call_id": m["tool_call_id"],
+                "output": out_str,  # Must be a string
+            })
+        # Regular chat messages stay unchanged
+        else:
+            converted.append(m)
+    return converted
+
+# Generate OpenAI Responses API tool format from LiteLLM format
+OPENAI_TOOLS = convert_litellm_to_openai(AVAILABLE_TOOLS)
+
 if USE_NAVIGATOR:
+    # Add navigator tool to LiteLLM format
     AVAILABLE_TOOLS.append({
         "type": "function",
         "function": {
             "name": "navigate_to",
-            "description": "Automatically navigate to a position on the map grid. The screen is divided into a 9x10 grid, with the top-left corner as (0, 0). This tool is only available in the overworld.",
+            "description": "Navigate to a specific position on the map.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -120,6 +192,9 @@ if USE_NAVIGATOR:
             }
         }
     })
+    
+    # Regenerate OpenAI tools after adding the navigator tool
+    OPENAI_TOOLS = convert_litellm_to_openai(AVAILABLE_TOOLS)
 
 
 class SimpleAgent:
@@ -276,21 +351,77 @@ class SimpleAgent:
                     if len(messages) >= 5 and messages[-3]["role"] == "user" and isinstance(messages[-3]["content"], list) and messages[-3]["content"]:
                         messages[-3]["content"][-1]["cache_control"] = {"type": "ephemeral"}
 
-                # Get response using LiteLLM
-                response = completion(
-                    model=MODEL_NAME,
-                    messages=[{"role": "system", "content": SYSTEM_PROMPT}] + messages,
-                    max_tokens=MAX_TOKENS,
-                    temperature=TEMPERATURE,
-                    tools=AVAILABLE_TOOLS
-                )
-
-                logger.info(f"Response usage: {response.usage}")
-
-                # Get the message content and tool calls
-                message = response.choices[0].message
-                content = message.content
-                tool_calls = message.tool_calls if hasattr(message, 'tool_calls') else []
+                # Get response using either LiteLLM or direct OpenAI API
+                if API_TYPE == "litellm":
+                    # Use LiteLLM for the completion
+                    response = completion(
+                        model=MODEL_NAME,
+                        messages=[{"role": "system", "content": SYSTEM_PROMPT}] + messages,
+                        max_tokens=MAX_TOKENS,
+                        temperature=TEMPERATURE,
+                        tools=AVAILABLE_TOOLS
+                    )
+                    
+                    logger.info(f"Response usage: {response.usage}")
+                    
+                    # Get the message content and tool calls
+                    message = response.choices[0].message
+                    content = message.content
+                    tool_calls = message.tool_calls if hasattr(message, 'tool_calls') else []
+                    
+                    # No reasoning summary available with LiteLLM
+                    reasoning_summary = None
+                    
+                else:  # API_TYPE == "openai"
+                    # Use OpenAI's Responses API directly to get reasoning summaries
+                    client = openai.OpenAI()
+                    
+                    # Prepare the input for the Responses API
+                    system_message = {"role": "system", "content": SYSTEM_PROMPT}
+                    
+                    # Convert the message history to Responses API format
+                    converted_messages = history_for_responses(messages)
+                    all_messages = [system_message] + converted_messages
+                    
+                    # Format the input as a simple array of messages for the Responses API
+                    response = client.responses.create(
+                        model=MODEL_NAME,
+                        input=all_messages,  # Converted messages in Responses API format
+                        tools=OPENAI_TOOLS,  # Use OpenAI-specific tool format
+                        reasoning={
+                            "effort": REASONING_EFFORT,
+                            "summary": REASONING_SUMMARY
+                        }
+                    )
+                    
+                    # Get the message content and tool calls
+                    content = ""
+                    tool_calls = []
+                    reasoning_summary = None
+                    
+                    # Process each output item
+                    for item in response.output:
+                        # Extract message content
+                        if item.type == "message":
+                            # Get the message content
+                            for content_item in item.content:
+                                if content_item.type == "output_text":
+                                    content += content_item.text
+                        
+                        # Extract function call if available
+                        elif item.type == "function_call":
+                            # Create a tool call object compatible with the rest of the code
+                            tool_call = type('ToolCall', (), {})()
+                            tool_call.id = item.call_id
+                            tool_call.function = type('Function', (), {})()
+                            tool_call.function.name = item.name
+                            tool_call.function.arguments = item.arguments
+                            tool_calls.append(tool_call)
+                        
+                        # Extract reasoning summary if available
+                        elif item.type == "reasoning" and hasattr(item, "summary") and item.summary:
+                            reasoning_summary = item.summary[0].text
+                            logger.info(f"[Reasoning Summary] {reasoning_summary}")
                 
                 # Display the model's reasoning
                 logger.info(f"[Text] {content}")
@@ -307,10 +438,16 @@ class SimpleAgent:
                         logger.info(f"Arguments: {tc.function.arguments}")
                     
                     # Add LLM's response to history
-                    self.message_history.append({
+                if content or tool_calls:
+                    # Create the assistant message with content and tool calls
+                    assistant_message = {
                         "role": "assistant",
-                        "content": content,
-                        "tool_calls": [{
+                        "content": content
+                    }
+                    
+                    # Add tool calls if any
+                    if tool_calls:
+                        assistant_message["tool_calls"] = [{
                             "id": tc.id,
                             "type": "function",
                             "function": {
@@ -318,30 +455,31 @@ class SimpleAgent:
                                 "arguments": tc.function.arguments
                             }
                         } for tc in tool_calls]
+                    
+                    # Add the assistant message to history
+                    self.message_history.append(assistant_message)
+                
+                # Process tool calls and create tool results
+                tool_results = []
+                for tool_call in tool_calls:
+                    # Process the tool call directly without creating an adapted version
+                    tool_result = self.process_tool_call(tool_call)
+                    tool_results.append(tool_result)
+                
+                # Add tool results to message history
+                for i, tool_call in enumerate(tool_calls):
+                    tool_result_text = ""
+                    # Extract text content from the tool result
+                    for content_item in tool_results[i].get('content', []):
+                        if content_item.get('type') == 'text':
+                            tool_result_text += content_item.get('text', '') + "\n"
+                    
+                    # Add as a tool message with the specific tool_call_id
+                    self.message_history.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": tool_result_text.strip()
                     })
-                    
-                    # Process tool calls and create tool results
-                    tool_results = []
-                    for tool_call in tool_calls:
-                        # Process the tool call directly without creating an adapted version
-                        tool_result = self.process_tool_call(tool_call)
-                        tool_results.append(tool_result)
-                    
-                    # Add tool results to message history in a format compatible with OpenAI/LiteLLM
-                    # For OpenAI, we need to add a tool message for each tool call
-                    for i, tool_call in enumerate(tool_calls):
-                        tool_result_text = ""
-                        # Extract text content from the tool result
-                        for content_item in tool_results[i].get('content', []):
-                            if content_item.get('type') == 'text':
-                                tool_result_text += content_item.get('text', '') + "\n"
-                        
-                        # Add as a tool message with the specific tool_call_id
-                        self.message_history.append({
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "content": tool_result_text.strip()
-                        })
                     
                     # Also add a user message to continue the conversation
                     self.message_history.append({
@@ -406,16 +544,65 @@ class SimpleAgent:
             }
         ]
         
-        # Get summary using LiteLLM
-        response = completion(
-            model=MODEL_NAME,
-            messages=[{"role": "system", "content": SYSTEM_PROMPT}] + messages,
-            max_tokens=MAX_TOKENS,
-            temperature=TEMPERATURE
-        )
-        
-        # Extract the summary text
-        summary_text = response.choices[0].message.content
+        # Get summary using either LiteLLM or direct OpenAI API
+        if API_TYPE == "litellm":
+            # Use LiteLLM for the summary
+            response = completion(
+                model=MODEL_NAME,
+                messages=[{"role": "system", "content": SYSTEM_PROMPT}] + messages,
+                max_tokens=MAX_TOKENS,
+                temperature=TEMPERATURE
+            )
+            
+            # Extract the summary text
+            summary_text = response.choices[0].message.content
+            
+            # No reasoning summary available with LiteLLM
+            reasoning_summary = None
+            
+        else:  # API_TYPE == "openai"
+            # Use OpenAI's Responses API directly to get reasoning summaries
+            client = openai.OpenAI()
+            
+            # Prepare the input for the Responses API
+            system_message = {"role": "system", "content": SYSTEM_PROMPT}
+            
+            # Convert the message history to Responses API format
+            converted_messages = history_for_responses(messages)
+            all_messages = [system_message] + converted_messages
+            
+            # Format the input as a simple array of messages for the Responses API
+            response = client.responses.create(
+                model=MODEL_NAME,
+                input=all_messages,  # Converted messages in Responses API format
+                reasoning={
+                    "effort": REASONING_EFFORT,
+                    "summary": REASONING_SUMMARY
+                }
+            )
+            
+            # Extract the summary text and reasoning summary
+            summary_text = ""
+            reasoning_summary = None
+            
+            # Process each output item
+            for item in response.output:
+                # Extract message content
+                if item.type == "message":
+                    # Get the message content
+                    for content_item in item.content:
+                        if content_item.type == "output_text":
+                            summary_text += content_item.text
+                
+                # Extract reasoning summary if available
+                elif item.type == "reasoning" and hasattr(item, "summary") and item.summary:
+                    reasoning_summary = item.summary[0].text
+                    logger.info(f"[Summarization Reasoning] {reasoning_summary}")
+                    
+            if not summary_text:
+                # Fallback in case we couldn't extract the summary text
+                logger.warning("Could not extract summary text from OpenAI response, using default")
+                summary_text = "Could not generate summary. Continuing with the game."
         
         logger.info(f"[Agent] Game Progress Summary:")
         logger.info(f"{summary_text}")
